@@ -1,0 +1,206 @@
+---
+title: "Making Data"
+author: "W205 Project 3 - MJOB"
+date: "3/24/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(sandwich)
+
+```
+## R Markdown
+
+First thing we need to do is figure out is generally what insights we want, I'll get us started with a couple:
+
+-In game incentives: Joining a guild = more play time?
+  -Bought a sword, join a guild = more play time
+-Expanding paid base: 
+  -The more they play, the more people they recommend?  
+  -The more they play, the likelier they are to subscribe? 
+-Micro-transactions: More they play the more the buy swords or more they pay to join a guild? 
+
+-Bought a sword, join a guild should result in linear increases to play time, which in turn will drive everything else, "we can say something like, the incentives team were looking at ways to drive up play time which we know is correlated etc etc, so we introduced swords and guilds to the game" 
+
+First let's make a template table
+
+```{r cars}
+
+num_players <- 1000
+
+d <- data.table(
+  id = rep(1:num_players, each = 11), #create slots for 10 months for each player
+  month = rep(0:10), #fill in a month in each row 
+  mon_hrs_played = 0, # a logistic regression based on whether someone has a sword or is in a guild
+  mon_fr_ref = 0, #just a factor more based on play time
+  sub = 0, #more likely to subscribe once you cross a particular play threshold
+  money_paid = 0, #probably also a logistic model
+  acct_open = 1
+)
+
+```
+
+Now let's fill in the table, first for num of sub and ten month each
+```{r }
+d[, id := sample(100001:300000, size = 1), keyby = id]
+#build in randomly assigned swords and guilds and subs, i.e. start the experiment 
+d[, sword := sample(c(0,1), size = 1, prob = c(.9, .1)), keyby = id ]
+d[, guild := sample(c(0,1), size = 1, prob = c(.9, .1)), by = id]
+d[, sub := sample(c(0,1), size = 1, prob = c(.8, .2)), by = id]
+#dummy variable for if players have swords and guilds, important for later
+d[, sw_a_g := sword*guild]
+
+
+#pseudo code
+#draw hours played for month = 0 from a distribution of mean = 10, std dev = 1.5
+#to simulate a group of relatively new players
+d[month == 0, mon_hrs_played := rnorm(.N, mean = 10, sd = 1.5)]
+#seed money paid
+d[month == 0, money_paid := rnorm(.N, mean = 5, sd = 2)]
+
+
+#so for all months in the trial
+for(cur_mon in 1:10){
+  
+  #set sword and guild based on hours played, treating sword and guilds as irreversible events
+  d[month == cur_mon, sword := ifelse(d$sword[d$month == cur_mon - 1] == 0 & 
+                                        d$mon_hrs_played[d$month == cur_mon - 1] > 11.5, 
+                                      sample(c(0,1), size = .N, prob = c(.3,.7), replace = TRUE),
+                                      ifelse(d$sword[d$month == cur_mon - 1] == 0 & 
+                                        d$mon_hrs_played[d$month == cur_mon - 1] <= 11.5, 
+                                             sample(c(0,1), size = .N, prob = c(.9,.1), replace = TRUE),
+                                             1))]
+  
+  #set guild based on hours played
+  d[month == cur_mon, guild := ifelse(d$guild[d$month == cur_mon - 1] == 0 & 
+                                        d$mon_hrs_played[d$month == cur_mon - 1] > 11.5, 
+                                      sample(c(0,1), size = .N, prob = c(.3,.7), replace =TRUE),
+                                      ifelse(d$guild[d$month == cur_mon - 1] == 0 & 
+                                        d$mon_hrs_played[d$month == cur_mon - 1] <= 11.5, 
+                                             sample(c(0,1), size = .N, prob = c(.9,.1), replace = TRUE),
+                                             1))]
+  
+  d[, sw_a_g := sword*guild]
+  
+  #now set subscriptions
+  d[month == cur_mon, sub := ifelse(d$sub[d$month == cur_mon - 1] == 0 & #if a player was not a subscriber last month
+                                      #and a player played more than 14 hours last month
+                                      d$mon_hrs_played[d$month == cur_mon - 1] > 14, 
+                                    #then they have a 70% likelihood of subscribing
+                                      sample(c(0,1), size = .N, prob = c(.3,.7), replace = TRUE),
+                                    #else if the player was a subscriber last month they stay a sub
+                                      ifelse(d$sub[d$month == cur_mon - 1] == 1,  1,
+                                             #else if they played less 14 hours, and weren't a sub, then
+                                             #then a player has a 20% of subscribing
+                                             sample(c(0,1), size = .N, prob = c(.8,.2), replace = TRUE)))]
+  #account closed
+  d[month == cur_mon, acct_open := ifelse(d$acct_open[d$month == cur_mon-1] == 1 &  
+                                            #if players have an open account and
+                                            #played less than 12 hours in a given month 
+                                            d$mon_hrs_played[d$month == cur_mon - 1] < 12,
+                                          #then they have a 5% of closing their account
+                                          sample(c(0,1),size = .N, prob = c(.05, .95), replace = TRUE), 
+                                          #else, if their account was already closed last month, there's a 2%
+                                          #chance they will come back
+                                          ifelse(d$acct_open[d$month == cur_mon - 1] == 0, 
+                                                 0,
+                                                 #if it was open and they played more than 13 hours, they have a 1%
+                                                 #chance of closing
+                                            sample(c(0,1),size = .N, prob = c(.005,.995), replace = TRUE)))]
+  
+  #now build out hours played
+  #first clause, for identified month across all players
+  d[month == cur_mon, mon_hrs_played := ifelse(
+    #if the player is either in sword or guild
+    xor(sword, guild),
+    #then monthly hours = 1st month + a logisitc function amounting to a 4 hour increase, with inflection point at month 4, plus some noise
+      d$mon_hrs_played[d$month == ifelse(cur_mon - 1 > 0, cur_mon-1, 0)] + 
+      4/(1+exp(-1*(cur_mon-4)))+rnorm(.N,0,1),
+    #now, if a player has neither sword nor a guild, their monthly hours will randomly 'walk' aka, we will draw randomly from a distribution with new mean = last months play time and SD 1.5 hr.
+    ifelse(sw_a_g == 0,
+      rnorm(.N, d$mon_hrs_played[d$month == cur_mon - 1],1),
+      #but if they have both a sword and a guild, then their monthly hours will = 1st month + a logistic regression with inflection point at month 4 amounting to a 9 hour increase with some noise added
+      d$mon_hrs_played[d$month == 0] + 
+        9/(1+exp(-1*(cur_mon - 4)))))]
+  
+  #money paid
+  d[month == cur_mon, money_paid := ifelse(
+    #if the player is either in sword or guild
+    d$mon_hrs_played[d$month == cur_mon] > 14 & d$sub[d$month == cur_mon] == 1,
+    #then payment is a monthly logistic regression up to $20 a month 
+      abs(d$money_paid[d$month == 0] + 15/(1+exp(-1*((cur_mon+10)-4)))+rnorm(.N,0,1) +5),
+    #if you are just a normal subscriber then $5 monthly plus slightly more random spending 
+    ifelse(d$sub[d$month == cur_mon] == 1,
+           abs(d$money_paid[d$month == 0] + 5 + rnorm(.N,0,.5)),
+           #non-subscribers pay around $5 a month
+            abs(rnorm(.N, 5, 2))))]
+  
+  #now friend referral, pull from 3 distributions based on 3 stratas
+  d[month == cur_mon, mon_fr_ref := ifelse(
+    #if a player plays less than 12 hours a month, draw from a dist of 1 with sd .5, and round
+    d$mon_hrs_played[d$month == cur_mon] < 12,
+    abs(round(rnorm(.N, 1, .5))),
+    #else if the player between 12 and 16 hrs, draw from a distribution with mean 2 and sd .5 and round
+    ifelse(
+      12 <= d$mon_hrs_played[d$month == cur_mon] & 
+        d$mon_hrs_played[d$month == cur_mon] < 16,
+      abs(round(rnorm(.N, 2, .5))),
+      #anything above 16, draw from a distribution of 4 with sd .5
+      abs(round(rnorm(.N, 4, .5)))
+    ))]
+  
+  #multiply all rate stats by account closed
+  d[, money_paid := money_paid*acct_open]
+  d[, mon_hrs_played := mon_hrs_played*acct_open]
+  d[, sub := sub*acct_open]
+  d[, mon_fr_ref := mon_fr_ref*acct_open]
+  d[, sword := sword*acct_open]
+  d[, guild := guild*acct_open]
+  
+  d[, sw_a_g := sword*guild]
+
+}
+
+summary(d[, money_paid])
+
+#write.csv(d, 'sample_data_v7.csv')
+
+```
+
+```{r scraps}
+
+#so now for version 3, 
+#rnorm(.N, d$mon_hrs_played[d$month == cur_mon - 1],1.5)*5,
+
+#rnorm(.N, d$mon_hrs_played[d$month == cur_mon - 1],1.5)*10
+
+mon_hrs <- function(sword, guild){
+  samp = rnorm(q,15,5)
+  ret = NA
+  if(xor(sword, guild)){
+    ret = samp*(1.25)
+  }else if(sword & guild){
+    ret = samp*1.4
+  }else{
+    ret = samp
+  }
+  return = ret
+}
+
+#now modify monthly play time if they have a sword or are assigned in a guild
+d[, mon_hrs_played := rnorm(.N, 15, 3)*ifelse(
+  xor(sword, guild), 1.2, 1) * ifelse(sword & guild, 1.08, 1) 
+  ]
+
+summary(rep(ifelse(round(rnorm(.N, 1, .5)) > 0, round(rnorm(.N, 1, .5)), 0),100000))
+
+ifelse(test2 = round(rnorm(.N, 2, .5)) > 0, test2 , 0)
+
+help(":=")
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
